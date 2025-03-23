@@ -3,6 +3,8 @@ Mac specific
 
 purgatory/
 
+terraform/terraform.tfvars
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
