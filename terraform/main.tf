@@ -16,21 +16,22 @@ locals {
   environment = "dev"
   name_prefix = "hemolytics-${local.environment}"
   common_tags = {
-    Environment = local.environment
-    Project     = "Hemolytics"
-    ManagedBy   = "Terraform"
+    environment = local.environment
+    project     = "hemolytics"
+    datasource  = "crimsoncache"
+    managedby   = "terraform"
   }
 }
 
-# S3 Bucket
-resource "aws_s3_bucket" "github_data_bucket" {
-  bucket = "${local.name_prefix}-github-data"
-  tags   = merge(local.common_tags, { Name = "GitHub SQLite Data" })
+# s3 bucket for landing data from crimsoncache
+resource "aws_s3_bucket" "crimson_data_bucket" {
+  bucket = "${local.name_prefix}-crimson-data"
+  tags   = merge(local.common_tags, { name = "crimsoncache data" })
 }
 
-# ... and block public access because folks don't need to seeing this. 
-resource "aws_s3_bucket_public_access_block" "github_data_public_access_block" {
-  bucket = aws_s3_bucket.github_data_bucket.id
+# block public access
+resource "aws_s3_bucket_public_access_block" "data_public_access_block" {
+  bucket = aws_s3_bucket.crimson_data_bucket.id
 
   block_public_acls       = true
   block_public_policy     = true
@@ -38,9 +39,9 @@ resource "aws_s3_bucket_public_access_block" "github_data_public_access_block" {
   restrict_public_buckets = true
 }
 
-# Enable Server-Side Encryption - AWS is handeling with key storage 
-resource "aws_s3_bucket_server_side_encryption_configuration" "github_data_encryption" {
-  bucket = aws_s3_bucket.github_data_bucket.id
+# enable server-side encryption
+resource "aws_s3_bucket_server_side_encryption_configuration" "data_encryption" {
+  bucket = aws_s3_bucket.crimson_data_bucket.id
 
   rule {
     apply_server_side_encryption_by_default {
@@ -48,25 +49,50 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "github_data_encry
     }
   }
 }
-# Create the VPC
+
+# enable s3 lifecycle rules to optimize costs
+resource "aws_s3_bucket_lifecycle_configuration" "data_lifecycle" {
+  bucket = aws_s3_bucket.crimson_data_bucket.id
+
+  rule {
+    id     = "transition-to-ia"
+    status = "Enabled"
+
+    filter {
+      prefix = ""
+    }
+
+    transition {
+      days          = 30
+      storage_class = "STANDARD_IA"
+    }
+
+    transition {
+      days          = 90
+      storage_class = "GLACIER"
+    }
+  }
+}
+
+# create the vpc
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
 
   tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-vpc"
+    name = "${local.name_prefix}-vpc"
   })
 }
 
-# Create two private subnets in different availability zones
+# create two private subnets
 resource "aws_subnet" "private_1" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.1.0/24"
   availability_zone = "us-east-1a"
 
   tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-private-subnet-1"
+    name = "${local.name_prefix}-private-subnet-1"
   })
 }
 
@@ -76,7 +102,117 @@ resource "aws_subnet" "private_2" {
   availability_zone = "us-east-1b"
 
   tags = merge(local.common_tags, {
-    Name = "${local.name_prefix}-private-subnet-2"
+    name = "${local.name_prefix}-private-subnet-2"
   })
 }
 
+# create a subnet group for rds
+resource "aws_db_subnet_group" "postgres_subnet_group" {
+  name       = "${local.name_prefix}-subnet-group"
+  subnet_ids = [aws_subnet.private_1.id, aws_subnet.private_2.id]
+
+  lifecycle {
+    # Prevent changes to subnet_ids to avoid VPC mismatch errors
+    ignore_changes = [subnet_ids]
+  }
+
+  tags = merge(local.common_tags, {
+    name = "${local.name_prefix}-db-subnet-group"
+  })
+}
+
+# Secrets Manager for database credentials
+resource "aws_secretsmanager_secret" "db_credentials" {
+  name = "${local.name_prefix}-db-credentials"
+
+  tags = merge(local.common_tags, {
+    name = "database credentials"
+  })
+}
+
+# IAM Role for Lambda
+resource "aws_iam_role" "crimson_fetch_role" {
+  name = "${local.name_prefix}-crimson-fetch-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Action = "sts:AssumeRole",
+        Effect = "Allow",
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  tags = local.common_tags
+}
+
+# Fix IAM Policy using a new policy name to avoid conflicts
+resource "aws_iam_policy" "crimson_fetch_policy_v2" {
+  name        = "${local.name_prefix}-crimson-fetch-policy-v2"
+  description = "Policy for Lambda to fetch CrimsonCache data and put in S3"
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Action = [
+          "s3:PutObject",
+          "s3:ListBucket"
+        ],
+        Effect = "Allow",
+        Resource = [
+          aws_s3_bucket.crimson_data_bucket.arn,
+          "${aws_s3_bucket.crimson_data_bucket.arn}/*"
+        ]
+      },
+      {
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ],
+        Effect   = "Allow",
+        Resource = "arn:aws:logs:*:*:*"
+      },
+      {
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ],
+        Effect   = "Allow",
+        Resource = aws_secretsmanager_secret.db_credentials.arn
+      }
+    ]
+  })
+}
+
+# Attach the new policy to the role
+resource "aws_iam_role_policy_attachment" "crimson_fetch_policy_attachment" {
+  role       = aws_iam_role.crimson_fetch_role.name
+  policy_arn = aws_iam_policy.crimson_fetch_policy_v2.arn
+}
+
+# Ensure proper IAM permissions for tags
+resource "aws_iam_policy" "additional_permissions" {
+  name        = "${local.name_prefix}-additional-permissions"
+  description = "Additional permissions for Terraform automation"
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Action   = ["ssm:AddTagsToResource", "redshift-serverless:TagResource"],
+        Effect   = "Allow",
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "additional_permissions_attachment" {
+  role       = aws_iam_role.crimson_fetch_role.name
+  policy_arn = aws_iam_policy.additional_permissions.arn
+}
