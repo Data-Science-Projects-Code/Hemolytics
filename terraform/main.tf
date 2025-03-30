@@ -216,3 +216,53 @@ resource "aws_iam_role_policy_attachment" "additional_permissions_attachment" {
   role       = aws_iam_role.crimson_fetch_role.name
   policy_arn = aws_iam_policy.additional_permissions.arn
 }
+
+
+# Lambda function to fetch data from GitHub
+resource "aws_lambda_function" "github_fetch_lambda" {
+  function_name    = "${local.name_prefix}-github-fetch"
+  filename         = "../src/github_fetch_lambda.zip"
+  source_code_hash = filebase64sha256("../src/github_fetch_lambda.zip")
+  role             = aws_iam_role.crimson_fetch_role.arn
+  handler          = "github_fetch.handler"
+  runtime          = "python3.12"
+  timeout          = 300 # 5 minutes
+  memory_size      = 256 # MB
+
+  environment {
+    variables = {
+      S3_BUCKET   = aws_s3_bucket.crimson_data_bucket.id
+      GITHUB_REPO = "Data-Science-Projects-Code/CrimsonCache"
+      GITHUB_PATH = "data"
+    }
+  }
+
+  tags = merge(local.common_tags, {
+    name = "${local.name_prefix}-github-fetch-lambda"
+  })
+}
+
+# CloudWatch Event Rule - Run once per day
+resource "aws_cloudwatch_event_rule" "daily_github_fetch" {
+  name                = "${local.name_prefix}-daily-github-fetch"
+  description         = "Trigger GitHub fetch Lambda function once per day"
+  schedule_expression = "cron(0 0 * * ? *)" # Run at midnight UTC every day
+
+  tags = local.common_tags
+}
+
+# CloudWatch Event Target - Connect rule to Lambda
+resource "aws_cloudwatch_event_target" "lambda_target" {
+  rule      = aws_cloudwatch_event_rule.daily_github_fetch.name
+  target_id = "GitHubFetchLambda"
+  arn       = aws_lambda_function.github_fetch_lambda.arn
+}
+
+# Lambda permission to allow CloudWatch Events to invoke function
+resource "aws_lambda_permission" "allow_cloudwatch" {
+  statement_id  = "AllowExecutionFromCloudWatch"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.github_fetch_lambda.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.daily_github_fetch.arn
+}
